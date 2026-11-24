@@ -1,170 +1,139 @@
-# Autonomous GitHub PR & Code Reviewer Agent
+# AuditAgent: Autonomous Solidity Auditor & Invariant Regression Engine
 
-A production-grade, multi-agent automated GitHub pull request and code review engine built with **LangGraph**, **FastAPI**, **Next.js 14+ (App Router)**, **Tailwind CSS**, and **PostgreSQL with pgvector**.
+> **DISCLAIMER:** Automated tooling, not a substitute for a manual audit.
+
+AuditAgent is an autonomous smart contract security reviewer designed for Web3 developers and security engineers reviewing code before deployment. It discovers vulnerabilities via static analysis, synthesizes Foundry invariant regression tests in an isolated local sandbox, proves issues by asserting security invariants, and generates minimal unified patches that resolve the defect.
 
 ---
 
-## 1. System Architecture
+## Key Highlights
 
-```mermaid
-flowchart TD
-    subgraph Client["Frontend (Next.js 14 App Router)"]
-        UI["Review Dashboard & PR Input"]
-        SSE["SSE Replay & Live Client"]
-        DiffV["Interactive Diff Viewer (Anchored Annotations)"]
-        TestP["Generated Tests Panel (1-Click Copy)"]
-        MetB["Observability & Metrics Bar"]
-    end
+- **Pre-Deployment Invariant Testing**: Evaluates authorized local code. Never broadcasts transactions to live networks.
+- **Empirical Defect Reproduction**: Findings are classified as `Reproduced` only when a generated Foundry test fails against the target code and passes after applying the patch.
+- **Isolated Sandbox**: Runs in ephemeral `/tmp/auditagent_<id>` workspaces with a 60s execution timeout and read-only RPC access.
+- **SWC Registry Aligned**: Covers SWC-107 (Reentrancy), SWC-105 (Missing Access Control), SWC-104 (Unchecked Low-Level Calls), SWC-115 (`tx.origin`), and SWC-101 (Arithmetic).
+- **Streaming Telemetry**: Real-time Server-Sent Events (SSE) pipe LangGraph node transitions and logs straight to the Next.js UI.
+- **Side-by-Side Diff Viewer**: Integrated `react-diff-viewer-continued` component with split-view and inline mode for remediation inspection.
 
-    subgraph API["FastAPI Backend Service"]
-        Router["/api/reviews & /webhooks/github"]
-        Replay["Event Replay & EventSource Streaming"]
-        GHClient["GitHub REST API Client (Diff, Files, Contents)"]
-    end
+---
 
-    subgraph LangGraphEngine["LangGraph Multi-Agent Workflow Engine"]
-        direction TB
-        N1["Node 1: Context Retriever<br/>(AST Chunking, HNSW pgvector search)"]
-        N2["Node 2: Security & Bug Auditor<br/>(SQLi, XSS, Auth Flaws, unidiff line anchoring)"]
-        N3["Node 3: Test Generator<br/>(pytest/jest generation, static syntax check, self-repair)"]
-        N4["Node 4: Synthesizer<br/>(Risk Score 0-100, Verdict, Executive Summary)"]
-        
-        N1 --> N2
-        N2 --> N3
-        N3 --> N4
-    end
+## Repository Structure
 
-    subgraph Storage["Persistence & LLM Layer"]
-        PG[("PostgreSQL 16 + pgvector<br/>(HNSW cosine index, reviews, events)")]
-        LLM["Provider-Agnostic LLM Client<br/>(Anthropic Claude 3.5 Sonnet / OpenAI GPT-4o)"]
-    end
-
-    UI -->|POST /api/reviews| Router
-    Router -->|Background Task| GHClient
-    GHClient -->|Fetch diff & metadata| LangGraphEngine
-    Router -->|Subscribe /stream| SSE
-    SSE -->|Live Events| DiffV & TestP & MetB
-
-    N1 <-->|Embeddings & Similarity| PG
-    N1 <-->|Text Embeddings| LLM
-    N2 <-->|Structured Audit Tool-calling| LLM
-    N3 <-->|Test Generation & Repair| LLM
-    N4 <-->|Summary Synthesis| LLM
-    N4 -->|Persist Final Review| PG
+```
+.
+├── apps/
+│   ├── agent/                 # Python 3.11 + FastAPI + LangGraph Backend
+│   │   ├── Dockerfile
+│   │   ├── requirements.txt   # Pinned dependencies
+│   │   ├── src/
+│   │   │   ├── api/           # Endpoints: /audit, /audit/{id}/stream, /audit/{id}/report.md
+│   │   │   ├── graph/         # LangGraph nodes, state, and retry workflow
+│   │   │   ├── tools/         # Slither runner, Foundry sandbox, Etherscan resolver
+│   │   │   ├── models/        # Shared Pydantic models (Finding, AuditJob)
+│   │   │   └── utils/         # Diff generator and Markdown report synthesizer
+│   │   └── tests/             # Pytest suite & E2E verification
+│   └── web/                   # Next.js 14 App Router + Tailwind + viem/wagmi
+│       ├── Dockerfile
+│       ├── package.json
+│       └── src/
+│           ├── app/           # App Router pages and layouts
+│           ├── components/    # Monaco editor, Timeline, Findings matrix, Diff viewer
+│           └── types/         # Matching TypeScript interfaces
+├── contracts-samples/         # Insecure educational test fixtures
+│   ├── ReentrancyBank.sol     # SWC-107 fixture
+│   ├── AccessControlVault.sol # SWC-105 fixture
+│   ├── UncheckedCall.sol      # SWC-104 fixture
+│   └── README.md
+├── docs/
+│   └── ARCHITECTURE.md        # Comprehensive system architecture & state design
+├── docker-compose.yml         # Containerized web + agent (Foundry & Slither preloaded)
+├── .env.example               # Pinned environment variables template
+└── README.md                  # This file
 ```
 
 ---
 
-## 2. Key Features
+## Quickstart
 
-- **Multi-Agent LangGraph Workflow**: Explicit typed state graph (`ReviewState`) traversing 4 specialized nodes:
-  1. **Context Retriever**: Extracts modified symbols and dependency imports from the diff, chunks changed files, stores vector embeddings in PostgreSQL using `pgvector` with HNSW cosine indexes, and retrieves top-k relevant context chunks.
-  2. **Security & Bug Auditor**: Scans for SQL injection, Cross-Site Scripting (XSS), broken authorization, exposed secrets, race conditions, null pointer bugs, and unsafe deserialization. Anchors findings to exact diff line coordinates with server-side `unidiff` validation to drop hallucinated locations.
-  3. **Test Generator**: Generates executable `pytest` (Python) or `jest` (JS/TS) tests covering happy paths, edge cases, and reproduction test suites for discovered bugs. Statically syntax-checks generated tests (`compile()` / AST parse) without executing untrusted code on the host, with automatic single self-healing retry.
-  4. **Synthesizer**: Synthesizes an executive review summary, computes a deterministic risk score (0-100), and issues the official PR verdict (`approve`, `comment`, `request_changes`).
-- **Resilient SSE Streaming with Replay**: `GET /api/reviews/{id}/stream` replays historical events from `review_events` table before seamlessly continuing live broadcasts, ensuring browser reloads and reconnections never lose progress.
-- **Interactive Diff Viewer**: Inline color-coded annotations on exact lines (Critical: Red, High: Orange, Medium: Yellow, Low: Blue, Info: Purple) with expandable explanations and 1-click suggested remediation snippets.
-- **Full Observability & Metrics**: Real-time tracking of prompt tokens, completion tokens, per-agent execution latency, estimated USD cost, and risk score.
-- **GitHub Webhook Integration**: `POST /webhooks/github` endpoint with HMAC SHA-256 signature verification (`X-Hub-Signature-256`) to automatically trigger reviews on PR `opened` and `synchronize` events.
+### Prerequisites
+- Python 3.11+
+- Node.js 18+ & npm
+- (Optional) Docker & Docker Compose
+- (Optional) Foundry & Slither for native execution
 
----
-
-## 3. Quickstart & Installation
-
-### Option A: Docker Compose (Production Setup)
-
+### 1. Environment Configuration
 ```bash
-# 1. Clone repository and copy environment configuration
 cp .env.example .env
-
-# 2. Add your LLM credentials (Anthropic or OpenAI) in .env:
-# ANTHROPIC_API_KEY=your_key_here
-# or
-# OPENAI_API_KEY=your_key_here
-
-# 3. Build and start all services (db, backend, frontend)
-docker compose up --build -d
-
-# 4. Open dashboard in your browser
-# Frontend: http://localhost:3000
-# Backend API: http://localhost:8000
 ```
 
-### Option B: Local Development Mode
-
-#### Backend
+### 2. Run with Docker Compose
 ```bash
-cd backend
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+docker compose up --build
+```
+- Web UI: `http://localhost:3000`
+- API Backend & Docs: `http://localhost:8000/docs`
 
-# Run backend
-uvicorn app.main:app --port 8000 --reload
+### 3. Local Development Setup
+
+#### Backend (`/apps/agent`)
+```bash
+python -m pip install -r apps/agent/requirements.txt
+python -m uvicorn apps.agent.src.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-#### Frontend
+#### Frontend (`/apps/web`)
 ```bash
-cd frontend
+cd apps/web
 npm install
 npm run dev
-# Open http://localhost:3000
 ```
 
 ---
 
-## 4. Environment Variables Reference
+## Running Automated Tests
 
-| Variable | Default | Description |
-|---|---|---|
-| `LLM_PROVIDER` | `anthropic` | LLM provider: `anthropic` or `openai` |
-| `ANTHROPIC_API_KEY` | - | Anthropic Claude API key |
-| `ANTHROPIC_MODEL` | `claude-3-5-sonnet-20241022` | Anthropic model identifier |
-| `OPENAI_API_KEY` | - | OpenAI API key |
-| `OPENAI_MODEL` | `gpt-4o` | OpenAI model identifier |
-| `EMBEDDING_PROVIDER` | `openai` | Embedding provider: `openai` or `deterministic` |
-| `EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI embedding model name |
-| `EMBEDDING_DIM` | `1536` | Dimension of vector embeddings |
-| `DATABASE_URL` | `postgresql+asyncpg://postgres:postgres@db:5432/pr_reviewer` | PostgreSQL asyncpg URI |
-| `GITHUB_TOKEN` | - | Optional GitHub PAT for higher rate limits |
-| `GITHUB_WEBHOOK_SECRET` | `development_webhook_secret_key_32_bytes_min` | Secret for HMAC webhook verification |
-| `POST_GITHUB_COMMENTS` | `false` | Enable posting review comments back to GitHub |
-| `NEXT_PUBLIC_API_URL` | `http://localhost:8000` | Backend API URL for frontend |
-
----
-
-## 5. Security & Safety Hardening
-
-1. **Prompt Injection Hardening**: All repository code and diff chunks are treated as strictly untrusted user data. Prompts enclose code in delimiter fences (`<<<UNTRUSTED_CONTENT_START>>> ... <<<UNTRUSTED_CONTENT_END>>>`) paired with explicit system-level instructions forbidding agents from following instructions or directives embedded within code comments or variables.
-2. **Host Execution Sandboxing**: Generated unit tests and untrusted repository code are **never** executed directly on the host system. Test validation runs purely through static syntax checks (`compile(code, "<string>", "exec")` in Python, token verification in JS/TS).
-3. **Diff Line Anchoring**: LLMs frequently hallucinate line coordinates. The auditor validates every emitted finding against the real line numbers produced by `unidiff.PatchSet`. Any unanchored finding is either snapped to the nearest valid diff hunk or safely dropped.
-
----
-
-## 6. Running Evaluations & Verification
-
-### Run Automated Security Evaluation Suite
-Evaluates the Security & Bug Auditor across 6 planted vulnerability diff fixtures (SQLi, DOM XSS, broken auth, race condition, secrets exposure, unsafe deserialization):
+Run the backend verification suite (includes static detectors, Foundry test runner, and end-to-end LangGraph audit loop):
 
 ```bash
-python backend/evals/run_evals.py
+python -m pytest apps/agent/tests/test_agent_tools.py -v
 ```
 
-### Run Backend Unit & Integration Tests
+Run the API and SSE streaming integration check:
 ```bash
-pytest backend/tests/ -v
-```
-
-### Lint & Build Frontend
-```bash
-cd frontend
-npm run lint
-npm run build
+python apps/agent/tests/verify_e2e.py
 ```
 
 ---
 
-## 7. Known Limitations & Roadmap
+## Demo Walkthrough Script (for GIF / Video)
 
-- **Multi-repo Dependency Tracing**: Current context retriever indexes the files modified within the pull request. Deep monorepo cross-package dependency resolution is on the roadmap.
-- **Sandboxed Test Execution**: Future iterations will execute generated tests in isolated Firecracker microVMs or Docker containers to verify test pass/fail status in real time.
+Follow this 60-second walkthrough to record a demo GIF of AuditAgent:
+
+1. **Launch the Web Dashboard**:
+   Open `http://localhost:3000` in your browser. Notice the dark-mode layout, live Foundry sandbox badge, and prominent safety disclaimer.
+2. **Load Sample Contract**:
+   Click the **"ReentrancyBank"** sample button in the code editor toolbar. The insecure contract populates instantly with line annotations.
+3. **Trigger Autonomous Audit**:
+   Click the **"Run Autonomous Audit"** button.
+4. **Observe Live LangGraph Pipeline**:
+   Watch the live timeline progress through:
+   - `01 Source Resolver`: Normalizes the AST and extracts contract interfaces.
+   - `02 Static Analysis`: Detects SWC-107 (Checks-Effects-Interactions violation).
+   - `03 Foundry Invariant Engine`: Compiles a `.t.sol` test, executes it against the vulnerable code (`[FAIL] Invariant broken`), updates status to `Reproduced`, and validates the unified fix diff (`[PASS]`).
+   - `04 Report Synthesizer`: Synthesizes unified diffs and markdown report.
+5. **Inspect Proof & Remediation**:
+   Click on finding `FINDING-001` in the matrix. The detail drawer opens showing:
+   - Side-by-side color-coded unified diff (`balances[msg.sender] = 0;` placed before `.call`).
+   - The generated Foundry invariant test code.
+   - The raw `forge test -vvv` logs.
+6. **Export Audit Report**:
+   Click **"Export Markdown"** to download `audit_report_ReentrancyBank.md`.
+
+---
+
+## Ethical Boundaries & Scope
+
+- **Developer Pre-Deployment Tool**: Built to audit code owned or authorized by the developer prior to deployment.
+- **Isolated Testing**: All invariant checks execute locally in sandboxed temporary directories (`/tmp/auditagent_<id>`).
+- **No Transaction Broadcasting**: Never signs or broadcasts transactions to live blockchain networks.
+- **Standardized Weaknesses**: Uses standard SWC Registry classifications for transparent defect tracking.
