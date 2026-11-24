@@ -1,0 +1,39 @@
+# Node & Frontend
+node_modules/
+.next/
+out/
+build/
+dist/
+*.log
+
+# Python & Backend
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment Variables & Secrets
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Sandbox & Temporary Files
+/tmp/
+auditagent_*
+.foundry/
+cache/
+artifacts/
+
+# OS specific
+.DS_Store
+Thumbs.db
